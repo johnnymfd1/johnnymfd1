@@ -1,0 +1,169 @@
+"""
+Solana Token Account Scanner ("Duster")
+---------------------------------------
+Read-only. No private keys. No transactions. Just reads token accounts,
+balances, freeze status, and flags tokens where creator holds freeze authority.
+
+Dependencies:
+    pip install solana solders
+
+Usage:
+    python solana_duster.py <WALLET_ADDRESS>
+"""
+
+import sys
+import json
+from typing import Optional
+from solana.rpc.api import Client
+from solders.pubkey import Pubkey
+from solana.rpc.types import TokenAccountOpts
+
+# Public RPC endpoint - rate limited but free
+RPC_ENDPOINT = "https://api.mainnet-beta.solana.com"
+
+# SPL Token Program ID (constant across all Solana)
+TOKEN_PROGRAM_ID = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
+# Token-2022 Program ID (newer token standard)
+TOKEN_2022_PROGRAM_ID = Pubkey.from_string("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb")
+
+
+def get_token_accounts(client: Client, wallet: Pubkey, program_id: Pubkey) -> list:
+    """
+    Fetch all token accounts owned by a wallet for a given token program.
+    READ-ONLY: Just queries the RPC, no state changes.
+    """
+    try:
+        response = client.get_token_accounts_by_owner_json_parsed(
+            wallet,
+            TokenAccountOpts(program_id=program_id)
+        )
+        if response.value:
+            return response.value
+        return []
+    except Exception as e:
+        print(f"[ERROR] Failed to fetch token accounts: {e}")
+        return []
+
+
+def get_mint_info(client: Client, mint_address: str) -> Optional[dict]:
+    """
+    Fetch mint metadata to check freeze authority.
+    READ-ONLY: Just queries account data.
+    """
+    try:
+        mint_pubkey = Pubkey.from_string(mint_address)
+        response = client.get_account_info_json_parsed(mint_pubkey)
+        if response.value and response.value.data:
+            return response.value.data.parsed.get("info", {})
+        return None
+    except Exception as e:
+        print(f"[WARN] Could not fetch mint info for {mint_address}: {e}")
+        return None
+
+
+def scan_wallet(wallet_address: str) -> None:
+    """
+    Main scanner function. Iterates all token accounts, checks balances,
+    freeze status, and flags risky freeze authorities.
+    """
+    print(f"\n{'='*70}")
+    print(f"SOLANA TOKEN SCANNER - READ ONLY")
+    print(f"{'='*70}")
+    print(f"Wallet: {wallet_address}")
+    print(f"RPC:    {RPC_ENDPOINT}")
+    print(f"{'='*70}\n")
+
+    # Validate wallet address
+    try:
+        wallet_pubkey = Pubkey.from_string(wallet_address)
+    except Exception as e:
+        print(f"[FATAL] Invalid wallet address: {e}")
+        sys.exit(1)
+
+    client = Client(RPC_ENDPOINT)
+
+    # Check both token programs
+    all_accounts = []
+    
+    print("[*] Scanning SPL Token Program...")
+    spl_accounts = get_token_accounts(client, wallet_pubkey, TOKEN_PROGRAM_ID)
+    all_accounts.extend(spl_accounts)
+    print(f"    Found {len(spl_accounts)} accounts")
+
+    print("[*] Scanning Token-2022 Program...")
+    token_2022_accounts = get_token_accounts(client, wallet_pubkey, TOKEN_2022_PROGRAM_ID)
+    all_accounts.extend(token_2022_accounts)
+    print(f"    Found {len(token_2022_accounts)} accounts")
+
+    if not all_accounts:
+        print("\n[!] No token accounts found for this wallet.")
+        return
+
+    print(f"\n{'='*70}")
+    print(f"TOKEN ACCOUNTS ({len(all_accounts)} total)")
+    print(f"{'='*70}\n")
+
+    flagged_tokens = []
+
+    for i, account in enumerate(all_accounts, 1):
+        account_data = account.account.data.parsed.get("info", {})
+        
+        mint = account_data.get("mint", "Unknown")
+        token_amount = account_data.get("tokenAmount", {})
+        balance = token_amount.get("uiAmountString", "0")
+        decimals = token_amount.get("decimals", 0)
+        is_frozen = account_data.get("state") == "frozen"
+        
+        # Fetch mint info to check freeze authority
+        mint_info = get_mint_info(client, mint)
+        freeze_authority = None
+        has_freeze_authority = False
+        
+        if mint_info:
+            freeze_authority = mint_info.get("freezeAuthority")
+            has_freeze_authority = freeze_authority is not None
+
+        # Print account details
+        print(f"[{i}] Token Account: {account.pubkey}")
+        print(f"    Mint:            {mint}")
+        print(f"    Balance:         {balance} (decimals: {decimals})")
+        print(f"    Frozen:          {'YES ⚠️' if is_frozen else 'No'}")
+        print(f"    Freeze Authority: {freeze_authority if freeze_authority else 'None (revoked)'}")
+        
+        # Flag if freeze authority still exists
+        if has_freeze_authority:
+            print(f"    ⚠️  WARNING: Freeze authority active - creator can freeze your tokens!")
+            flagged_tokens.append({
+                "mint": mint,
+                "balance": balance,
+                "freeze_authority": freeze_authority,
+                "is_frozen": is_frozen
+            })
+        
+        print()
+
+    # Summary of flagged tokens
+    if flagged_tokens:
+        print(f"\n{'='*70}")
+        print(f"⚠️  FLAGGED TOKENS ({len(flagged_tokens)} with active freeze authority)")
+        print(f"{'='*70}")
+        for token in flagged_tokens:
+            status = "FROZEN" if token["is_frozen"] else "at risk"
+            print(f"  • {token['mint'][:20]}... | Balance: {token['balance']} | Status: {status}")
+        print(f"\nThese tokens can be frozen by the authority at any time.")
+        print("Consider this before holding significant value in them.")
+    else:
+        print("\n✅ No tokens with active freeze authority found.")
+
+    print(f"\n{'='*70}")
+    print("Scan complete. No transactions were made.")
+    print(f"{'='*70}\n")
+
+
+if __name__ == "__main__":
+    if len(sys.argv) != 2:
+        print("Usage: python solana_duster.py <WALLET_ADDRESS>")
+        print("Example: python solana_duster.py 7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU")
+        sys.exit(1)
+    
+    scan_wallet(sys.argv[1])
